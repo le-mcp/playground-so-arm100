@@ -19,8 +19,13 @@ import {
   CanvasTexture,
   Float32BufferAttribute,
   RepeatWrapping,
+  BoxGeometry,
+  MeshBasicMaterial,
+  MeshPhongMaterial,
+  BufferGeometry
 } from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import URDFLoader from 'urdf-loader';
 // 导入控制工具函数
 import { setupKeyboardControls, setupControlPanel } from './robotControls.js';
@@ -122,11 +127,103 @@ function init() {
     
     // 加载模型
     const manager = new LoadingManager();
+    
+    // Add a onProgress callback to track loading progress
+    manager.onProgress = (url, itemsLoaded, itemsTotal) => {
+      console.log(`Loading ${url}: ${itemsLoaded} of ${itemsTotal} files.`);
+    };
+    
+    // Add an onError callback to catch loading errors
+    manager.onError = (url) => {
+      console.error(`Error loading ${url}`);
+    };
+    
     const loader = new URDFLoader(manager);
+    
+    // Flag to track loading attempts
+    let isRetryingWithLowerDetail = false;
+    
+    // Add parsing options to handle large STL files
+    loader.loadMeshCb = (path, manager, onComplete) => {
+      if (isRetryingWithLowerDetail) {
+        // On retry with error, use a simple box placeholder
+        console.warn(`Creating placeholder for ${path} due to previous load error`);
+        const boxGeometry = new BoxGeometry(1, 1, 1);
+        const material = new MeshBasicMaterial({ color: 0xaaaaaa });
+        onComplete(new Mesh(boxGeometry, material));
+        return;
+      }
+      
+      try {
+        const stlLoader = new STLLoader(manager);
+        
+        // Set lower memory usage by using a lower mesh detail
+        stlLoader.load(
+          path,
+          (geometry) => {
+            try {
+              // Simplify geometry if it's too large
+              let finalGeometry = geometry;
+              const vertexCount = geometry.attributes.position.count;
+              
+              console.log(`Loaded geometry with ${vertexCount} vertices from ${path}`);
+              
+              // Different levels of simplification based on vertex count
+              if (vertexCount > 50000) {
+                finalGeometry = simplifyGeometry(geometry, 0.9); // 90% reduction for very large meshes
+              } else if (vertexCount > 20000) {
+                finalGeometry = simplifyGeometry(geometry, 0.7); // 70% reduction for large meshes
+              } else if (vertexCount > 10000) {
+                finalGeometry = simplifyGeometry(geometry, 0.5); // 50% reduction for medium meshes
+              }
+              
+              const material = new MeshPhongMaterial({
+                color: 0x999999,
+                shininess: 100,
+                specular: 0x111111,
+              });
+              
+              onComplete(new Mesh(finalGeometry, material));
+            } catch (err) {
+              console.error(`Error processing geometry for ${path}:`, err);
+              // Create a simple placeholder mesh for the failed processing
+              const boxGeometry = new BoxGeometry(1, 1, 1);
+              const material = new MeshBasicMaterial({ color: 0xaaaaaa });
+              onComplete(new Mesh(boxGeometry, material));
+            }
+          },
+          null,
+          (error) => {
+            console.error(`Error loading mesh: ${path}`, error);
+            // Create a simple placeholder mesh for the failed load
+            const boxGeometry = new BoxGeometry(1, 1, 1);
+            const material = new MeshBasicMaterial({ color: 0xff0000 });
+            onComplete(new Mesh(boxGeometry, material));
+          }
+        );
+      } catch (err) {
+        console.error(`Exception during STL loading setup for ${path}:`, err);
+        // Create a simple placeholder mesh for catastrophic errors
+        const boxGeometry = new BoxGeometry(1, 1, 1);
+        const material = new MeshBasicMaterial({ color: 0xff0000 });
+        onComplete(new Mesh(boxGeometry, material));
+      }
+    };
 
-    loader.load(`/URDF/${modelToLoad}.urdf`, result => {
-      window.robot = result;
-    });
+    // First attempt to load with normal settings
+    try {
+      loader.load(`/URDF/${modelToLoad}.urdf`, result => {
+        window.robot = result;
+      });
+    } catch (err) {
+      console.error("Error during initial URDF load, retrying with lower detail:", err);
+      isRetryingWithLowerDetail = true;
+      
+      // Retry with lower detail (all placeholders)
+      loader.load(`/URDF/${modelToLoad}.urdf`, result => {
+        window.robot = result;
+      });
+    }
 
     // 等待模型加载完成
     manager.onLoad = () => {
@@ -203,6 +300,56 @@ function render() {
   }
   
   renderer.render(scene, camera);
+}
+
+// Helper function to simplify geometry by reducing vertex count
+function simplifyGeometry(geometry, targetReduction = 0.5) {
+  if (!geometry.attributes.position) return geometry;
+  
+  const positionAttr = geometry.attributes.position;
+  const vertexCount = positionAttr.count;
+  const targetCount = Math.floor(vertexCount * (1 - targetReduction));
+  
+  // If the geometry is already small enough, return it as is
+  if (vertexCount <= targetCount) return geometry;
+  
+  // Create a simplified vertex array
+  const step = Math.ceil(vertexCount / targetCount);
+  const newPositions = [];
+  const newNormals = [];
+  
+  // Keep only a subset of vertices
+  for (let i = 0; i < vertexCount; i += step) {
+    newPositions.push(
+      positionAttr.getX(i),
+      positionAttr.getY(i),
+      positionAttr.getZ(i)
+    );
+    
+    // Copy normals if they exist
+    if (geometry.attributes.normal) {
+      const normalAttr = geometry.attributes.normal;
+      newNormals.push(
+        normalAttr.getX(i),
+        normalAttr.getY(i),
+        normalAttr.getZ(i)
+      );
+    }
+  }
+  
+  // Create a new BufferGeometry with reduced data
+  const simplified = new BufferGeometry();
+  simplified.setAttribute('position', new Float32BufferAttribute(newPositions, 3));
+  
+  if (geometry.attributes.normal) {
+    simplified.setAttribute('normal', new Float32BufferAttribute(newNormals, 3));
+  } else {
+    // Compute normals if they don't exist
+    simplified.computeVertexNormals();
+  }
+  
+  console.log(`Simplified geometry from ${vertexCount} to ${newPositions.length / 3} vertices`);
+  return simplified;
 }
 
 // 添加创建格子纹理的函数
